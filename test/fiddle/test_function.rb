@@ -313,6 +313,51 @@ module Fiddle
       assert_equal(0, n2, perror("poll(2) in sub-thread"))
     end
 
+    def test_variadic_concurrent_calls
+      unless Fiddle.const_defined?("TYPE_VARIADIC")
+        omit "libffi doesn't support variadic arguments"
+      end
+      if Fiddle::WINDOWS
+        snprintf_name = "_snprintf"
+      else
+        snprintf_name = "snprintf"
+      end
+      begin
+        snprintf_pointer = @libc[snprintf_name]
+      rescue Fiddle::DLError
+        omit "Can't find #{snprintf_name}: #{$!.message}"
+      end
+      snprintf = Function.new(snprintf_pointer,
+                              [
+                                :voidp,
+                                :size_t,
+                                :const_string,
+                                :variadic,
+                              ],
+                              :int)
+      threads = 4.times.map do |t|
+        Thread.new do
+          mismatches = []
+          Pointer.malloc(64, Fiddle::RUBY_FREE) do |output|
+            50_000.times do |i|
+              if t.even?
+                snprintf.call(output, output.size, "%d %s",
+                              :int, i, :const_string, "x")
+                expected = "#{i} x"
+              else
+                snprintf.call(output, output.size, "%.1f %.1f %.1f",
+                              :double, 1.5, :double, 2.5, :double, 3.5)
+                expected = "1.5 2.5 3.5"
+              end
+              mismatches << output.to_s unless output.to_s == expected
+            end
+          end
+          mismatches
+        end
+      end
+      assert_equal([[], [], [], []], threads.map(&:value))
+    end
+
     def test_no_memory_leak
       if RUBY_ENGINE == "jruby"
         omit("rb_obj_frozen_p() doesn't exist in JRuby")

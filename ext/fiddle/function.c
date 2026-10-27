@@ -262,6 +262,7 @@ static VALUE
 function_call(int argc, VALUE argv[], VALUE self)
 {
     struct nogvl_ffi_call_args args = { 0 };
+    ffi_cif variadic_cif;
     fiddle_function_t *func;
     fiddle_generic *generic_args;
     int n_fixed_args = 0;
@@ -274,7 +275,6 @@ function_call(int argc, VALUE argv[], VALUE self)
     VALUE alloc_buffer = 0;
 
     TypedData_Get_Struct(self, fiddle_function_t, &function_data_type, func);
-    args.cif = &func->cif;
 
     n_fixed_args = func->n_argument_types;
     if (func->is_variadic) {
@@ -301,7 +301,10 @@ function_call(int argc, VALUE argv[], VALUE self)
                           sizeof(fiddle_generic) * n_call_args +
                           sizeof(void *) * (n_call_args + 1) +
                           sizeof(VALUE) * n_call_args +
-                          (func->is_variadic ? sizeof(int) * n_call_args : 0));
+                          (func->is_variadic ?
+                           sizeof(ffi_type *) * (n_call_args + 1) +
+                           sizeof(int) * n_call_args :
+                           0));
     args.values = (void **)((char *)generic_args +
                             sizeof(fiddle_generic) * n_call_args);
     /* GC-scanned (conservatively) as part of the ALLOCV buffer.
@@ -321,7 +324,13 @@ function_call(int argc, VALUE argv[], VALUE self)
     MEMZERO(converted_args, VALUE, n_call_args);
 
     if (func->is_variadic) {
-        call_arg_types = (int *)(converted_args + n_call_args);
+        /* Variadic calls may pass different types each call, so each call
+         * prepares its own cif. The shared func->cif must not be touched:
+         * another thread may be inside ffi_call on it without the GVL. */
+        ffi_type **ffi_arg_types = (ffi_type **)(converted_args + n_call_args);
+        ffi_status result;
+
+        call_arg_types = (int *)(ffi_arg_types + n_call_args + 1);
         MEMCPY(call_arg_types, func->argument_types, int, n_fixed_args);
         for (i = n_fixed_args, i_call = n_fixed_args;
              i < argc;
@@ -331,54 +340,53 @@ function_call(int argc, VALUE argv[], VALUE self)
             (void)INT2FFI_TYPE(c_arg_type); /* raise */
             call_arg_types[i_call] = c_arg_type;
         }
-
-        /* Variadic calls may pass different types each call, so the
-         * cif must always be re-prepared */
-        if (func->cif.arg_types) {
-            xfree(func->cif.arg_types);
-            func->cif.arg_types = NULL;
-        }
-    }
-    else {
-        call_arg_types = func->argument_types;
-    }
-
-    if (!func->cif.arg_types) {
-        ffi_type **ffi_arg_types;
-        ffi_status result;
-
-        ffi_arg_types = xcalloc(n_call_args + 1, sizeof(ffi_type *));
         for (i_call = 0; i_call < n_call_args; i_call++) {
             ffi_arg_types[i_call] = INT2FFI_TYPE(call_arg_types[i_call]);
         }
         ffi_arg_types[i_call] = NULL;
 
-        if (func->is_variadic) {
 #ifdef HAVE_FFI_PREP_CIF_VAR
-            result = ffi_prep_cif_var(&func->cif,
-                                      func->abi,
-                                      n_fixed_args,
-                                      n_call_args,
-                                      INT2FFI_TYPE(func->return_type),
-                                      ffi_arg_types);
+        result = ffi_prep_cif_var(&variadic_cif,
+                                  func->abi,
+                                  n_fixed_args,
+                                  n_call_args,
+                                  INT2FFI_TYPE(func->return_type),
+                                  ffi_arg_types);
 #else
-            /* This code is never used because ffi_prep_cif_var()
-             * availability check is done in #initialize. */
-            result = FFI_BAD_TYPEDEF;
+        /* This code is never used because ffi_prep_cif_var()
+         * availability check is done in #initialize. */
+        result = FFI_BAD_TYPEDEF;
 #endif
+        if (result != FFI_OK) {
+            rb_raise(rb_eRuntimeError, "error creating CIF %d", result);
         }
-        else {
+        args.cif = &variadic_cif;
+    }
+    else {
+        call_arg_types = func->argument_types;
+
+        if (!func->cif.arg_types) {
+            ffi_type **ffi_arg_types;
+            ffi_status result;
+
+            ffi_arg_types = xcalloc(n_call_args + 1, sizeof(ffi_type *));
+            for (i_call = 0; i_call < n_call_args; i_call++) {
+                ffi_arg_types[i_call] = INT2FFI_TYPE(call_arg_types[i_call]);
+            }
+            ffi_arg_types[i_call] = NULL;
+
             result = ffi_prep_cif(&func->cif,
                                   func->abi,
                                   n_call_args,
                                   INT2FFI_TYPE(func->return_type),
                                   ffi_arg_types);
+            if (result != FFI_OK) {
+                xfree(ffi_arg_types);
+                func->cif.arg_types = NULL;
+                rb_raise(rb_eRuntimeError, "error creating CIF %d", result);
+            }
         }
-        if (result != FFI_OK) {
-            xfree(ffi_arg_types);
-            func->cif.arg_types = NULL;
-            rb_raise(rb_eRuntimeError, "error creating CIF %d", result);
-        }
+        args.cif = &func->cif;
     }
 
     for (i = 0, i_call = 0;
